@@ -142,22 +142,28 @@ class TradingEnv:
 def download_weekly(tickers, start, end, out_dir="data"):
     os.makedirs(out_dir, exist_ok=True)
     for t in tickers:
-        df = yf.download(
-            t, start=start, end=end, interval="1wk", auto_adjust=False, progress=False
-        )
-        if df.empty:
-            continue
-        # Flatten MultiIndex columns if present (yfinance returns MultiIndex even for single ticker)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        df = df[["Close", "Adj Close"]].copy()
-        df.reset_index(inplace=True)
-        df["Ticker"] = t
-        # ensure Close is Adjusted Close for returns (use 'Adj Close' if available)
-        # Ensure numeric types before assignment
-        df["Adj Close"] = pd.to_numeric(df["Adj Close"], errors="coerce")
-        df["Close"] = df["Adj Close"].copy()
-        df.to_csv(f"{out_dir}/{t}.csv", index=False)
+        print(f"Downloading {t} from {start} to {end}...")
+        try:
+            df = yf.download(
+                t, start=start, end=end, interval="1wk", auto_adjust=False, progress=False
+            )
+            if df.empty:
+                print(f"  Warning: No data downloaded for {t}")
+                continue
+            # Flatten MultiIndex columns if present (yfinance returns MultiIndex even for single ticker)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            df = df[["Close", "Adj Close"]].copy()
+            df.reset_index(inplace=True)
+            df["Ticker"] = t
+            # ensure Close is Adjusted Close for returns (use 'Adj Close' if available)
+            # Ensure numeric types before assignment
+            df["Adj Close"] = pd.to_numeric(df["Adj Close"], errors="coerce")
+            df["Close"] = df["Adj Close"].copy()
+            df.to_csv(f"{out_dir}/{t}.csv", index=False)
+            print(f"  ✓ Downloaded {len(df)} weeks of data for {t} (from {df['Date'].min()} to {df['Date'].max()})")
+        except Exception as e:
+            print(f"  Error downloading {t}: {e}")
 
 
 def prepare_features(
@@ -198,14 +204,28 @@ def assert_no_leak(df):
 
 
 def train_val_test_split(df, train_frac=0.6, val_frac=0.2):
+    """
+    Split data into train/val/test sets.
+    For small datasets, use a larger test fraction.
+    """
     n = len(df)
-    train_end = int(n * train_frac)
-    val_end = int(n * (train_frac + val_frac))
-    splits = {
-        "train": df.iloc[:train_end].reset_index(drop=True),
-        "val": df.iloc[train_end:val_end].reset_index(drop=True),
-        "test": df.iloc[val_end:].reset_index(drop=True),
-    }
+    
+    # If dataset is small, use simpler split (no validation, larger test)
+    if n < 50:
+        train_end = int(n * 0.7)
+        splits = {
+            "train": df.iloc[:train_end].reset_index(drop=True),
+            "val": df.iloc[train_end:train_end].reset_index(drop=True),  # Empty val set
+            "test": df.iloc[train_end:].reset_index(drop=True),
+        }
+    else:
+        train_end = int(n * train_frac)
+        val_end = int(n * (train_frac + val_frac))
+        splits = {
+            "train": df.iloc[:train_end].reset_index(drop=True),
+            "val": df.iloc[train_end:val_end].reset_index(drop=True),
+            "test": df.iloc[val_end:].reset_index(drop=True),
+        }
     return splits
 
 
@@ -327,8 +347,20 @@ def buy_and_hold(df):
 
 
 def sma_10_30(df):
+    """
+    Simple Moving Average crossover strategy: buy when MA_10 > MA_30.
+    Requires at least 30 data points for MA_30 calculation.
+    """
     # Ensure Close is numeric
     df["Close"] = pd.to_numeric(df["Close"], errors="coerce").fillna(0)
+    
+    # Check if we have enough data
+    if len(df) < 30:
+        # Return zeros if insufficient data
+        actions = pd.Series(0, index=df.index)
+        weekly_returns = pd.Series(0.0, index=df.index)
+        return weekly_returns, actions
+    
     if "MA_10" not in df.columns:
         df["MA_10"] = df["Close"].rolling(10).mean().shift(1)
     if "MA_30" not in df.columns:
@@ -338,7 +370,12 @@ def sma_10_30(df):
     )
     actions = (df["MA_10"] > df["MA_30"]).astype(int)
     actions = actions.map({0: 0, 1: 1})
-    weekly_returns = df["Return"].shift(-1).fillna(0) * actions
+    
+    # Only calculate returns where we have valid MA signals
+    if "Return" in df.columns:
+        weekly_returns = df["Return"].shift(-1).fillna(0) * actions
+    else:
+        weekly_returns = pd.Series(0.0, index=df.index)
     return weekly_returns, actions
 
 
@@ -346,13 +383,26 @@ def momentum_12_1(df):
     """
     12-month momentum on weekly data: 52-week lookback, shifted by 1 to avoid look-ahead.
     Returns long-only (1 or 0) actions by default (matches earlier baseline semantics).
+    Requires at least 53 data points (52 for lookback + 1 for shift).
     """
     # Ensure Close is numeric
     df["Close"] = pd.to_numeric(df["Close"], errors="coerce").fillna(0)
+    
+    # Check if we have enough data for 52-week momentum
+    if len(df) < 53:
+        # Return zeros if insufficient data
+        actions = pd.Series(0, index=df.index)
+        weekly_returns = pd.Series(0.0, index=df.index)
+        return weekly_returns, actions
+    
     # If dataset shorter than 52, pct_change(52) returns NaN -> .fillna(0)
     r52 = df["Close"].pct_change(52).shift(1).fillna(0)
     actions = (r52 > 0).astype(int)
-    weekly_returns = df["Return"].shift(-1).fillna(0) * actions
+    
+    if "Return" in df.columns:
+        weekly_returns = df["Return"].shift(-1).fillna(0) * actions
+    else:
+        weekly_returns = pd.Series(0.0, index=df.index)
     return weekly_returns, actions
 
 
@@ -558,8 +608,15 @@ class DQNAgent:
                 ep_reward = 0
         return total_rewards
 
-    def act_trajectory(self):
-        state = self.env.reset()
+    def act_trajectory(self, env=None):
+        """
+        Generate trajectory using greedy policy.
+        Args:
+            env: Optional environment to use. If None, uses self.env (training env).
+        """
+        if env is None:
+            env = self.env
+        state = env.reset()
         mapping = [-1, 0, 1]
         done = False
         actions = []
@@ -572,7 +629,7 @@ class DQNAgent:
             q = self.policy_net(state_t).detach().cpu().numpy()[0]
             a_idx = int(np.argmax(q))
             action = mapping[a_idx]
-            next_state, reward, done, _ = self.env.step(action)
+            next_state, reward, done, _ = env.step(action)
             actions.append(action)
             rets.append(reward)
             state = next_state
@@ -602,13 +659,29 @@ class GymTradingEnv(gym.Env):
         self.allow_short = bool(allow_short)
         self.done = False
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        """
+        Reset the environment to initial state.
+        Args:
+            seed: Optional seed for reproducibility (gymnasium requirement)
+            options: Optional dict for additional reset options
+        Returns:
+            observation, info tuple (gymnasium standard)
+        """
+        if seed is not None:
+            np.random.seed(seed)
         self.position = 0
         self.t = 0
         self.done = False
-        return self._get_obs()
+        obs = self._get_obs()
+        info = {}
+        return obs, info
 
     def step(self, action_idx):
+        """
+        Gymnasium-compatible step function.
+        Returns: (obs, reward, terminated, truncated, info)
+        """
         mapping = [-1, 0, 1]
         action = mapping[int(action_idx)]
         # enforce allow_short
@@ -627,13 +700,21 @@ class GymTradingEnv(gym.Env):
         else:
             reward = -cost - slip
         self.t += 1
+        
+        # Gymnasium uses terminated (episode ended normally) and truncated (episode ended due to limit)
+        terminated = False
+        truncated = False
         if self.t >= len(self.df) - 1:
             self.done = True
-        return self._get_obs(), float(reward), self.done, {}
+            terminated = True  # Episode ended naturally
+        
+        obs = self._get_obs()
+        info = {}
+        return obs, float(reward), terminated, truncated, info
 
     def _get_obs(self):
         cols = ["Close", "MA_5", "MA_10", "Return"]
-        return self.df.loc[self.t, cols].values.astype(float)
+        return self.df.loc[self.t, cols].values.astype(np.float32)  # Ensure float32 for gymnasium compatibility
 
 
 def train_ppo(df, timesteps=20000, seed=0, verbose=0, **kwargs):
@@ -661,17 +742,44 @@ def make_feature_bins(df, features, n_bins=5):
     return bins
 
 
-def walk_forward_slices(n, train=0.6, val=0.2, test=0.2, folds=3):
+def walk_forward_slices(n, train=0.6, val=0.2, test=0.2, folds=3, min_test_size=10):
+    """
+    Generate walk-forward validation slices.
+    Args:
+        n: Total number of data points
+        train: Fraction for training
+        val: Fraction for validation
+        test: Fraction for testing
+        folds: Number of folds
+        min_test_size: Minimum test window size (default 10)
+    Returns:
+        List of (start, train_end, val_end, test_end) tuples
+    """
     # even spacing for simplicity
     assert abs(train + val + test - 1.0) < 1e-9
+    
+    # If we don't have enough data for even one fold, adjust requirements
+    if n < min_test_size * folds:
+        # Reduce minimum test size or folds dynamically
+        min_test_size = max(2, int(n / (folds * 2)))  # At least 2, but allow more flexibility
+        if min_test_size < 2:
+            return []  # Not enough data at all
+    
     windows = []
-    step = int(n * test / folds)
+    step = max(1, int(n * test / folds))  # At least 1 step
+    
     for k in range(folds):
         start = 0
         train_end = int(n * train) + k * step
         val_end = train_end + int(n * val)
-        test_end = min(val_end + int(n * test), n)
-        if test_end - val_end < 10:
+        test_end = min(val_end + step, n)  # Each fold gets approximately step size
+        
+        # Ensure minimum test size
+        if test_end - val_end < min_test_size:
+            # Try to use remaining data if we're close to the end
+            if n - val_end >= min_test_size:
+                test_end = n
+                windows.append((start, train_end, val_end, test_end))
             break
         windows.append((start, train_end, val_end, test_end))
     return windows
@@ -679,17 +787,31 @@ def walk_forward_slices(n, train=0.6, val=0.2, test=0.2, folds=3):
 
 def train_eval_dqn(df, seeds=[0], steps=20000, folds=3):
     res = []
-    slices = walk_forward_slices(len(df), folds=folds)
+    n = len(df)
+    # Adjust folds based on available data
+    if n < 30:
+        folds = 1
+        min_test_size = 2
+    elif n < 50:
+        folds = min(2, folds)
+        min_test_size = 5
+    else:
+        min_test_size = 10
+    
+    slices = walk_forward_slices(n, folds=folds, min_test_size=min_test_size)
+    if len(slices) == 0:
+        print(f"  Warning: Insufficient data for walk-forward validation (have {n} points, need at least {min_test_size * folds} for {folds} folds)")
+        return pd.DataFrame(res)
     for fold_idx, (a, b, c, d) in enumerate(slices, start=1):
         train_df, val_df, test_df = df.iloc[a:b], df.iloc[b:c], df.iloc[c:d]
         for s in seeds:
             env_train = TradingEnv(train_df)
             env_val = TradingEnv(val_df)
-            TradingEnv(test_df)
+            env_test = TradingEnv(test_df)  # Create test environment
             agent = DQNAgent(env_train, obs_dim=4, val_env=env_val, seed=s)
             agent.train(n_steps=steps)
-            # evaluate on test
-            actions, rets = agent.act_trajectory()
+            # evaluate on test environment (not training environment)
+            actions, rets = agent.act_trajectory(env=env_test)
             metrics = compute_metrics(pd.Series(rets))
             metrics.update(dict(seed=s, fold=fold_idx))
             res.append(metrics)
@@ -698,23 +820,41 @@ def train_eval_dqn(df, seeds=[0], steps=20000, folds=3):
 
 def train_eval_ppo(df, seeds=[0], timesteps=20000, folds=3):
     res = []
-    slices = walk_forward_slices(len(df), folds=folds)
+    n = len(df)
+    # Adjust folds based on available data
+    if n < 30:
+        folds = 1
+        min_test_size = 2
+    elif n < 50:
+        folds = min(2, folds)
+        min_test_size = 5
+    else:
+        min_test_size = 10
+    
+    slices = walk_forward_slices(n, folds=folds, min_test_size=min_test_size)
+    if len(slices) == 0:
+        print(f"  Warning: Insufficient data for walk-forward validation (have {n} points, need at least {min_test_size * folds} for {folds} folds)")
+        return pd.DataFrame(res)
     for fold_idx, (a, b, c, d) in enumerate(slices, start=1):
-        train_df = df.iloc[a:b]
+        train_df, val_df, test_df = df.iloc[a:b], df.iloc[b:c], df.iloc[c:d]
         for s in seeds:
             # Train PPO on train_df (we could use val_df for early stopping hyper loop externally)
-            model, env = train_ppo(train_df, timesteps=timesteps, seed=s)
-            # Evaluate on test
-            obs = env.reset()
+            model, env_train = train_ppo(train_df, timesteps=timesteps, seed=s)
+            # Create test environment for evaluation
+            env_test = GymTradingEnv(test_df)
+            # Evaluate on test environment (not training environment)
+            obs, _ = env_test.reset()
             done = False
 
             def mapping(x):
                 return [-1, 0, 1][int(x)]
 
             weekly_returns = []
+            done = False
             while not done:
                 a, _ = model.predict(obs, deterministic=True)
-                obs, r, done, _ = env.step(mapping(a))
+                obs, r, terminated, truncated, _ = env_test.step(mapping(a))
+                done = terminated or truncated
                 weekly_returns.append(r)
             metrics = compute_metrics(pd.Series(weekly_returns))
             metrics.update(dict(seed=s, fold=fold_idx))
@@ -743,55 +883,128 @@ def run_multi_ticker(
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        # Remove rows with missing dates or invalid dates (future dates)
+        from datetime import datetime
+        today = datetime.now()
+        df = df[df["Date"].notna()].copy()
+        df = df[df["Date"] <= pd.Timestamp(today)].copy()
+        
+        if len(df) < 10:
+            print(f"\n⚠️  WARNING: {t} has only {len(df)} valid data points after filtering!")
+            print(f"   Date range requested: {start} to {end}")
+            print(f"   Valid date range in file: {df['Date'].min()} to {df['Date'].max() if len(df) > 0 else 'N/A'}")
+            print(f"   Suggestion: Use past dates (e.g., --start 2022-01-01 --end 2024-12-31)")
+        
         df = prepare_features(df)
         splits = train_val_test_split(df)
         test_df = splits["test"]
+        
+        # Debug: Show data sizes
+        print(f"\n{t} - Data sizes: Total={len(df)}, Train={len(splits['train'])}, Val={len(splits['val'])}, Test={len(test_df)}")
 
         # Baselines on full test split
-        for bname, bfn in [
-            ("bh", buy_and_hold),
-            ("sma", sma_10_30),
-            ("mom12_1", momentum_12_1),
-            ("rsi", rsi_rule),
-        ]:
-            try:
-                wr, _ = bfn(test_df.copy())
-                m = compute_metrics(wr)
-                m.update(dict(ticker=t, method=bname))
-                rows.append(m)
-            except Exception as e:
-                print(f"Baseline {bname} failed on {t}: {e}")
+        if len(test_df) < 2:
+            print(f"  Warning: Insufficient test data for baselines on {t} (need at least 2 points, got {len(test_df)})")
+        else:
+            for bname, bfn in [
+                ("bh", buy_and_hold),
+                ("sma", sma_10_30),
+                ("mom12_1", momentum_12_1),
+                ("rsi", rsi_rule),
+            ]:
+                try:
+                    wr, _ = bfn(test_df.copy())
+                    # Check if we got valid returns
+                    if len(wr) == 0 or wr.isna().all() or (wr == 0).all():
+                        print(f"  Warning: Baseline {bname} on {t} produced no valid returns")
+                    else:
+                        m = compute_metrics(wr)
+                        m.update(dict(ticker=t, method=bname))
+                        rows.append(m)
+                except Exception as e:
+                    print(f"Baseline {bname} failed on {t}: {type(e).__name__}: {e}")
 
         # DQN walk-forward
         try:
             dqn_df = train_eval_dqn(df, seeds=seeds, steps=dqn_steps)
             for _, r in dqn_df.iterrows():
                 rows.append(dict(ticker=t, method="dqn", **r.to_dict()))
+            print(f"✓ DQN training completed for {t} ({len(dqn_df)} results)")
+            # Print summary of DQN results
+            if not dqn_df.empty:
+                avg_sharpe = dqn_df["Sharpe"].mean() if "Sharpe" in dqn_df.columns else 0
+                avg_cagr = dqn_df["CAGR"].mean() if "CAGR" in dqn_df.columns else 0
+                print(f"  Average Sharpe: {avg_sharpe:.4f}, Average CAGR: {avg_cagr:.4f}")
         except Exception as e:
             print(f"DQN training failed for {t}: {e}")
 
-        # Q-Learning walk-forward
+        # Q-Learning walk-forward (using test split for evaluation)
         try:
-            q_env = TradingEnv(df)
-            q_agent = QLearningAgent(q_env)
-            q_agent.train(n_episodes=500)
-            actions, rets = q_agent.act_trajectory()
-            m = compute_metrics(pd.Series(rets))
-            m.update(dict(ticker=t, method="q_learning"))
-            rows.append(m)
+            # Check if test_df has enough data
+            if len(test_df) < 2:
+                print(f"  Warning: Insufficient test data for Q-Learning on {t} (need at least 2 points, got {len(test_df)})")
+            else:
+                # Train on full dataset, evaluate on test split
+                q_env_train = TradingEnv(df)
+                q_agent = QLearningAgent(q_env_train)
+                q_agent.train(n_episodes=500)
+                # Evaluate on test split
+                q_env_test = TradingEnv(test_df)
+                actions, rets = q_agent.act_trajectory(env=q_env_test)
+                if len(rets) > 0:
+                    m = compute_metrics(pd.Series(rets))
+                    m.update(dict(ticker=t, method="q_learning"))
+                    rows.append(m)
+                    print(f"✓ Q-Learning training completed for {t}")
+                    print(f"  Sharpe: {m.get('Sharpe', 0):.4f}, CAGR: {m.get('CAGR', 0):.4f}, Total Return: {m.get('TotalReturn', 0):.4f}")
+                else:
+                    print(f"  Warning: Q-Learning produced no returns for {t}")
         except Exception as e:
-            print(f"Q-Learning training failed for {t}: {e}")
+            import traceback
+            print(f"Q-Learning training failed for {t}: {type(e).__name__}: {e}")
+            if len(str(e)) < 50:  # Only show traceback for short error messages
+                traceback.print_exc()
 
         # PPO walk-forward
         try:
             ppo_df = train_eval_ppo(df, seeds=seeds, timesteps=ppo_timesteps)
             for _, r in ppo_df.iterrows():
                 rows.append(dict(ticker=t, method="ppo", **r.to_dict()))
+            print(f"✓ PPO training completed for {t} ({len(ppo_df)} results)")
+            # Print summary of PPO results
+            if not ppo_df.empty:
+                avg_sharpe = ppo_df["Sharpe"].mean() if "Sharpe" in ppo_df.columns else 0
+                avg_cagr = ppo_df["CAGR"].mean() if "CAGR" in ppo_df.columns else 0
+                print(f"  Average Sharpe: {avg_sharpe:.4f}, Average CAGR: {avg_cagr:.4f}")
         except Exception as e:
             print(f"PPO training failed for {t}: {e}")
 
     out = pd.DataFrame(rows)
     out.to_csv(f"{out_dir}/pooled_metrics.csv", index=False)
+    
+    # Print summary of all results
+    print("\n" + "="*60)
+    print("RESULTS SUMMARY")
+    print("="*60)
+    if not out.empty:
+        print(f"\nTotal results: {len(out)}")
+        print(f"\nMethods by ticker:")
+        for ticker in out["ticker"].unique():
+            ticker_results = out[out["ticker"] == ticker]
+            print(f"\n  {ticker}:")
+            for method in ticker_results["method"].unique():
+                method_results = ticker_results[ticker_results["method"] == method]
+                count = len(method_results)
+                if not method_results.empty:
+                    sharpe = method_results["Sharpe"].mean() if "Sharpe" in method_results.columns else 0
+                    cagr = method_results["CAGR"].mean() if "CAGR" in method_results.columns else 0
+                    total_return = method_results["TotalReturn"].mean() if "TotalReturn" in method_results.columns else 0
+                    print(f"    {method:15s} ({count} runs): Sharpe={sharpe:8.4f}, CAGR={cagr:10.4f}, TotalReturn={total_return:10.4f}")
+        print("\n" + "="*60)
+    else:
+        print("No results generated.")
+    
     return out
 
 
@@ -888,7 +1101,9 @@ class QLearningAgent:
         idx = []
         for i, val in enumerate(state):
             b = self.state_bins[i]
-            idx.append(np.digitize(val, b))
+            # Clamp indices to valid range [0, n_bins-1]
+            digitized = np.digitize(val, b)
+            idx.append(max(0, min(digitized, self.n_bins - 1)))
         return tuple(idx)
 
     def select_action(self, state):
@@ -919,19 +1134,31 @@ class QLearningAgent:
                 self.update(state, action_idx, reward, next_state, done)
                 state = next_state
 
-    def act_trajectory(self):
-        state = self.env.reset()
+    def act_trajectory(self, env=None):
+        """
+        Generate trajectory using greedy policy (epsilon=0, deterministic).
+        Args:
+            env: Optional environment to use. If None, uses self.env (training env).
+        """
+        if env is None:
+            env = self.env
+        state = env.reset()
         mapping = [-1, 0, 1]
         done = False
         actions = []
         rets = []
+        # Use deterministic policy (set epsilon to 0 temporarily for greedy selection)
+        original_epsilon = self.epsilon
+        self.epsilon = 0
         while not done:
             action_idx = self.select_action(state)
             action = mapping[action_idx]
-            next_state, reward, done, _ = self.env.step(action)
+            next_state, reward, done, _ = env.step(action)
             actions.append(action)
             rets.append(reward)
             state = next_state
+        # Restore original epsilon
+        self.epsilon = original_epsilon
         return np.array(actions), np.array(rets)
 
 
