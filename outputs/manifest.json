@@ -1,0 +1,29 @@
+{
+  "timestamp": "2025-11-01 14:51:52",
+  "git_commit": "unknown",
+  "args": {
+    "tickers": [
+      "AAPL",
+      "MSFT",
+      "SPY"
+    ],
+    "start": "2022-01-01",
+    "end": "2024-10-31",
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "costs": [
+      0.001
+    ],
+    "slippage": [
+      0.0,
+      0.0005
+    ],
+    "out_dir": "outputs",
+    "dqn_steps": 15000,
+    "ppo_timesteps": 20000
+  },
+  "numpy_seed": 3203840549
+}
